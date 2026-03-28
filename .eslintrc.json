@@ -1,0 +1,23 @@
+{
+    "env": {
+        "es2022": true,
+        "node": true
+    },
+    "parserOptions": {
+        "ecmaVersion": 2022,
+        "sourceType": "module"
+    },
+    "rules": {
+        "no-unused-vars": "warn",
+        "no-undef": "error",
+        "no-const-assign": "error",
+        "no-dupe-args": "error",
+        "no-dupe-keys": "error",
+        "no-unreachable": "warn",
+        "eqeqeq": "warn",
+        "no-empty": "warn",
+        "no-redeclare": "error",
+        "no-var": "warn",
+        "prefer-const": "warn"
+    }
+}
