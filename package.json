@@ -21,7 +21,8 @@
     "express": "^4.19.2",
     "node-telegram-bot-api": "^0.66.0",
     "solana-swap": "^1.1.2",
-    "solana-trade": "^1.1.0"
+    "solana-trade": "^1.1.0",
+    "winston": "^3.19.0"
   },
   "overrides": {
     "@coral-xyz/anchor": "0.29.0"
