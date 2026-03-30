@@ -40,15 +40,26 @@ function getConnection() {
     return new Connection(url);
 }
 async function withRpcFallback(fn) {
-    for (let attempt = 0; attempt < RPC_URLS.length; attempt++) {
+    const maxRetries = RPC_URLS.length;
+    let lastError;
+    
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
-            return await fn(getConnection());
+            const connection = getConnection();
+            return await fn(connection);
         } catch (err) {
-            logger.error(`RPC ${RPC_URLS[currentRpcIndex % RPC_URLS.length]} failed: ${err.message}`);
+            lastError = err;
+            logger.error(`RPC ${RPC_URLS[currentRpcIndex % RPC_URLS.length]} failed (attempt ${attempt + 1}): ${err.message}`);
             currentRpcIndex++;
+            
+            // Add exponential backoff for retries
+            if (attempt < maxRetries - 1) {
+                const delay = Math.min(1000 * Math.pow(2, attempt), 5000);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
         }
     }
-    throw new Error("All RPC endpoints failed");
+    throw new Error(`All RPC endpoints failed. Last error: ${lastError?.message}`);
 }
 
 // ---------- Config ----------
@@ -115,6 +126,17 @@ function clearSession(chatId) {
         userSessions.delete(cid);
     }
 }
+
+// Clean up expired sessions periodically
+setInterval(() => {
+    const now = Date.now();
+    for (const [chatId, session] of userSessions.entries()) {
+        if (now - session.created > 300000) { // 5 minutes
+            clearTimeout(session.timeout);
+            userSessions.delete(chatId);
+        }
+    }
+}, 60000); // Check every minute
 
 // Single message handler for prompts
 bot.on('message', (msg) => {
@@ -220,6 +242,10 @@ const STATE = {
     // Wallet Pool Config (10,000+ wallets)
     walletPoolSize: 100,           // Default generation count
     batchConcurrency: 10,          // Max parallel TXs for pool operations
+    
+    // Personality Mix for Maker Strategy
+    personalityMix: ['RETAIL', 'SCALPER', 'DIAMOND', 'WHALE'],
+    
     running: false
 };
 
@@ -233,7 +259,7 @@ function promptSetting(chatId, prompt, callback) {
             bot.sendMessage(chatId, "⏰ Prompt timed out. Please try again.");
         }
     }, 60000);
-    userSessions.set(cid, { action: 'prompt', timeout, callback });
+    userSessions.set(cid, { action: 'prompt', timeout, callback, created: Date.now() });
 }
 
 // ---------- Rate limiting ----------
@@ -255,6 +281,25 @@ function validateNumber(val, min, max, name) {
     return num;
 }
 
+function validateTokenAddress(address) {
+    if (!address || typeof address !== 'string') {
+        throw new Error('Token address is required');
+    }
+    if (address.length < 32 || address.length > 44) {
+        throw new Error('Invalid token address length');
+    }
+    // Basic base58 validation
+    try {
+        const decoded = bs58.decode(address);
+        if (decoded.length !== 32) {
+            throw new Error('Token address must be 32 bytes');
+        }
+    } catch (e) {
+        throw new Error('Invalid token address format');
+    }
+    return address;
+}
+
 // ---------- Utilities ----------
 function isAdmin(chatId) {
     if (!ADMIN_CHAT_ID) return true;
@@ -269,10 +314,20 @@ function getJitteredInterval(baseInterval, jitterPercent) {
     if (jitterPercent <= 0) return baseInterval;
     const variation = baseInterval * (jitterPercent / 100);
     let interval = Math.floor(getRandomFloat(baseInterval - variation, baseInterval + variation));
-    if (STATE.realismMode && STATE.humanizedDelays && Math.random() < 0.10) {
-        const distractionTime = Math.floor(getRandomFloat(5000, 15000));
-        logger.info(`[Realism] Human distraction +${distractionTime}ms`);
-        interval += distractionTime;
+    
+    if (STATE.realismMode && STATE.humanizedDelays) {
+        // 10% chance of a "human distraction" pause
+        if (Math.random() < 0.10) {
+            const distractionTime = Math.floor(getRandomFloat(5000, 15000));
+            logger.info(`[Realism] Human distraction interruption: +${distractionTime}ms`);
+            interval += distractionTime;
+        }
+        // 5% chance of a "deep think" pause
+        if (Math.random() < 0.05) {
+            const thinkTime = Math.floor(getRandomFloat(20000, 45000));
+            logger.info(`[Realism] User deep think: +${thinkTime}ms`);
+            interval += thinkTime;
+        }
     }
     return interval;
 }
@@ -472,77 +527,99 @@ async function sendSOL(connection, from, to, amountSOL) {
 }
 
 async function swap(tokenIn, tokenOut, keypair, connection, amount, chatId, silent = false) {
-    try {
-        let cleanAmount;
-        if (typeof amount === 'string' && amount === 'auto') {
-            cleanAmount = 'auto';
-        } else {
-            cleanAmount = parseFloat(parseFloat(amount).toFixed(6));
-            if (isNaN(cleanAmount) || cleanAmount <= 0) throw new Error(`Invalid amount: ${amount}`);
-        }
+    const maxRetries = 3;
+    let lastError;
+    
+    // Always use the connection's endpoint to ensure RPC fallback works
+    const activeRpc = connection.rpcEndpoint;
 
-        const currentSlippage = getDynamicSlippage(STATE.slippage);
-        const currentFee = getDynamicFee(STATE.priorityFee);
-
-        if (STATE.swapProvider === "SOLANA_TRADE") {
-            if (!SolanaTrade) throw new Error("SolanaTrade provider not loaded.");
-            const trade = new SolanaTrade(RPC_URL);
-            const isBuy = tokenIn === SOL_ADDR;
-            
-            const params = {
-                market: STATE.targetDex,
-                wallet: keypair,
-                mint: isBuy ? tokenOut : tokenIn,
-                amount: cleanAmount === 'auto' ? (await getTokenBalance(connection, keypair.publicKey, isBuy ? tokenOut : tokenIn)) : cleanAmount,
-                slippage: currentSlippage,
-                priorityFeeSol: currentFee,
-                tipAmountSol: STATE.useJito ? STATE.jitoTipAmount : 0,
-                sender: STATE.useJito ? 'JITO' : undefined,
-                skipConfirmation: STATE.useJito,
-                send: true 
-            };
-            
-            bot.sendMessage(chatId, `⚡ *SolanaTrade* [${STATE.targetDex}] ${isBuy?'Buy':'Sell'} in progress...`, { parse_mode: 'Markdown' });
-            const sig = isBuy ? await trade.buy(params) : await trade.sell(params);
-            if (!silent && sig) bot.sendMessage(chatId, `✅ Confirmed: https://solscan.io/tx/${sig}`);
-            return sig;
-        } else {
-            const solanaTracker = new SolanaTracker(keypair, RPC_URL);
-            const swapResponse = await solanaTracker.getSwapInstructions(
-                tokenIn, tokenOut, cleanAmount, currentSlippage, keypair.publicKey.toBase58(), STATE.useJito ? 0 : currentFee, false
-            );
-
-            if (!swapResponse || (!swapResponse.txn && !swapResponse.tx)) throw new Error('No transaction returned from API.');
-
-            let txid;
-            if (STATE.useJito) {
-                 const serializedTx = swapResponse.txn || swapResponse.tx;
-                 let b58Tx;
-                 if (typeof serializedTx === 'string') {
-                    b58Tx = serializedTx;
-                 } else {
-                    const txBuffer = Buffer.from(serializedTx, 'base64');
-                    b58Tx = bs58.encode(txBuffer);
-                 }
-                 txid = await sendJitoBundle([b58Tx], keypair, connection, STATE.jitoTipAmount);
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            let cleanAmount;
+            if (typeof amount === 'string' && amount === 'auto') {
+                cleanAmount = 'auto';
             } else {
-                txid = await solanaTracker.performSwap(swapResponse, {
-                    sendOptions: { skipPreflight: true },
-                    commitment: "confirmed",
-                });
+                cleanAmount = parseFloat(parseFloat(amount).toFixed(6));
+                if (isNaN(cleanAmount) || cleanAmount <= 0) throw new Error(`Invalid amount: ${amount}`);
             }
 
-            if (!silent && txid) bot.sendMessage(chatId, `✅ Confirmed: https://solscan.io/tx/${txid}`);
-            return txid;
+            const currentSlippage = getDynamicSlippage(STATE.slippage);
+            const currentFee = getDynamicFee(STATE.priorityFee);
+            const shortKey = keypair.publicKey.toBase58().substring(0, 8);
+
+            if (STATE.swapProvider === "SOLANA_TRADE") {
+                if (!SolanaTrade) throw new Error("SolanaTrade provider not loaded.");
+                const trade = new SolanaTrade(activeRpc);
+                const isBuy = tokenIn === SOL_ADDR;
+                
+                const targetMint = isBuy ? tokenOut : tokenIn;
+                const params = {
+                    market: STATE.targetDex,
+                    wallet: keypair,
+                    mint: targetMint,
+                    amount: cleanAmount === 'auto' ? (await getTokenBalance(connection, keypair.publicKey, targetMint)) : cleanAmount,
+                    slippage: currentSlippage,
+                    priorityFeeSol: currentFee,
+                    tipAmountSol: STATE.useJito ? STATE.jitoTipAmount : 0,
+                    sender: STATE.useJito ? 'JITO' : undefined,
+                    skipConfirmation: STATE.useJito,
+                    send: true 
+                };
+                
+                if (!silent && attempt === 0) bot.sendMessage(chatId, `⚡ *SolanaTrade* [${STATE.targetDex}] ${isBuy?'Buy':'Sell'} in progress...`, { parse_mode: 'Markdown' });
+                const sig = isBuy ? await trade.buy(params) : await trade.sell(params);
+                if (!silent && sig) bot.sendMessage(chatId, `✅ Confirmed: https://solscan.io/tx/${sig}`);
+                return sig;
+            } else {
+                const solanaTracker = new SolanaTracker(keypair, activeRpc);
+                const swapResponse = await solanaTracker.getSwapInstructions(
+                    tokenIn, tokenOut, cleanAmount, currentSlippage, keypair.publicKey.toBase58(), STATE.useJito ? 0 : currentFee, false
+                );
+
+                if (!swapResponse || (!swapResponse.txn && !swapResponse.tx)) throw new Error('No transaction returned from API.');
+
+                let txid;
+                if (STATE.useJito) {
+                     const serializedTx = swapResponse.txn || swapResponse.tx;
+                     let b58Tx;
+                     if (typeof serializedTx === 'string') {
+                        b58Tx = serializedTx;
+                     } else {
+                        const txBuffer = Buffer.from(serializedTx, 'base64');
+                        b58Tx = bs58.encode(txBuffer);
+                     }
+                     txid = await sendJitoBundle([b58Tx], keypair, connection, STATE.jitoTipAmount);
+                } else {
+                    txid = await solanaTracker.performSwap(swapResponse, {
+                        sendOptions: { skipPreflight: true },
+                        commitment: "confirmed",
+                    });
+                }
+
+                if (!silent && txid) bot.sendMessage(chatId, `✅ Confirmed: https://solscan.io/tx/${txid}`);
+                return txid;
+            }
+        } catch (e) {
+            lastError = e;
+            const errorMsg = e.message || "Unknown error";
+            const shortKey = keypair.publicKey.toBase58().substring(0, 8);
+            logger.error(`Swap error [${shortKey}] attempt ${attempt + 1}: ${errorMsg}`);
+            
+            // If it's a rate limit or connection error, maybe we should let withRpcFallback handle it?
+            // But swap is often called inside a strategy cycle which is already inside withRpcFallback.
+            if (attempt < maxRetries - 1) {
+                const delay = Math.min(1000 * Math.pow(2, attempt), 3000);
+                await sleep(delay);
+            }
         }
-    } catch (e) {
-        const errorMsg = e.message || "Unknown error";
-        const shortKey = keypair.publicKey.toBase58().substring(0, 8);
-        console.error(`Swap error [${shortKey}]:`, errorMsg);
-        if (!silent) bot.sendMessage(chatId, `⚠️ Swap failed [${shortKey}...]: ${errorMsg}`);
-        return null;
     }
+    
+    const shortKey = keypair.publicKey.toBase58().substring(0, 8);
+    logger.error(`Swap failed [${shortKey}] after ${maxRetries} attempts: ${lastError?.message || "Unknown error"}`);
+    if (!silent) bot.sendMessage(chatId, `⚠️ Swap failed [${shortKey}...]: ${lastError?.message || "Unknown error"}`);
+    return null;
 }
+
 
 
 
@@ -566,9 +643,7 @@ async function executeStandardCycles(chatId, connection) {
 
         for (let i = 0; i < STATE.numberOfCycles && STATE.running; i++) {
             const volMult = getVolumeMultiplier();
-            bot.sendMessage(chatId, `🔄 *Standard | Cycle ${i + 1}/${STATE.numberOfCycles}* | Vol: \`${volMult.toFixed(2)}x\``, { parse_mode: "Markdown" });
-
-            bot.sendMessage(chatId, `🛒 Buying SOL across ${activeWallets.length} wallets (per-wallet randomization)...`, { parse_mode: "Markdown" });
+            const cycleStartMsg = await bot.sendMessage(chatId, `🔄 *Standard Cycle ${i + 1}/${STATE.numberOfCycles}* | Vol: \`${volMult.toFixed(2)}x\``, { parse_mode: "Markdown" });
 
             await BatchSwapEngine.executeBatch(
                 activeWallets,
@@ -577,14 +652,21 @@ async function executeStandardCycles(chatId, connection) {
                     return await swap(SOL_ADDR, STATE.tokenAddress, w, connection, jitteredBuy, chatId, true);
                 },
                 STATE.batchConcurrency,
-                null,
+                (p) => {
+                    if (p.completed % 5 === 0 || p.completed === p.total) {
+                        bot.editMessageText(`🔄 *Standard Cycle ${i + 1}/${STATE.numberOfCycles}*\n🛒 Buying: ${p.completed}/${p.total} | ✅ ${p.successes} | ❌ ${p.failures}`, {
+                            chat_id: chatId,
+                            message_id: cycleStartMsg.message_id,
+                            parse_mode: "Markdown"
+                        }).catch(() => {});
+                    }
+                },
                 () => STATE.running
             );
 
             if (!STATE.running) break;
-            await sleep(getPoissonDelay(STATE.intervalBetweenActions));
+            await sleep(getPoissonDelay(STATE.intervalBetweenActions / 2));
 
-            bot.sendMessage(chatId, `📉 Selling positions...`, { parse_mode: "Markdown" });
             await BatchSwapEngine.executeBatch(
                 activeWallets,
                 async (w) => {
@@ -593,13 +675,21 @@ async function executeStandardCycles(chatId, connection) {
                     return null;
                 },
                 STATE.batchConcurrency,
-                null,
+                (p) => {
+                    if (p.completed % 5 === 0 || p.completed === p.total) {
+                        bot.editMessageText(`🔄 *Standard Cycle ${i + 1}/${STATE.numberOfCycles}*\n📉 Selling: ${p.completed}/${p.total} | ✅ ${p.successes} | ❌ ${p.failures}`, {
+                            chat_id: chatId,
+                            message_id: cycleStartMsg.message_id,
+                            parse_mode: "Markdown"
+                        }).catch(() => {});
+                    }
+                },
                 () => STATE.running
             );
 
             if (i < STATE.numberOfCycles - 1 && STATE.running) {
                 const wait = getPoissonDelay(STATE.intervalBetweenActions * 2);
-                bot.sendMessage(chatId, `⏳ Next cycle in \`${Math.round(wait / 1000)}s\`...`, { parse_mode: "Markdown" });
+                bot.sendMessage(chatId, `⏳ Cycle ${i+1} done. Natural rest: \`${Math.round(wait / 1000)}s\`...`, { parse_mode: "Markdown" });
                 await sleep(wait);
             }
         }
@@ -988,7 +1078,7 @@ async function executeWhaleSimulation(chatId, connection) {
                 const bal = await getTokenBalance(connection, w.publicKey, STATE.tokenAddress);
                 if (bal > 0) {
                     const dumpChunks = Math.floor(getRandomFloat(2, 5));
-                    const chunkPercent = (dumpPct / 100) / dumpChunks;
+                    const chunkPercent = (STATE.whaleSellPercent / 100) / dumpChunks;
                     for (let c = 0; c < dumpChunks; c++) {
                         const dumpAmt = parseFloat((bal * chunkPercent).toFixed(6));
                         await swap(STATE.tokenAddress, SOL_ADDR, w, connection, dumpAmt, chatId, true);
@@ -1011,6 +1101,54 @@ async function executeWhaleSimulation(chatId, connection) {
     }
     bot.sendMessage(chatId, `🐋 Whale simulation complete.`);
 }
+//             await fundWallets(connection, masterKeypair, activeWhales, fundNeeded, chatId);
+//         }
+
+//         // Accumulate
+//         bot.sendMessage(chatId, `🐋 Whale accumulation...`);
+//         await BatchSwapEngine.executeBatch(
+//             activeWhales,
+//             async (w) => {
+//                 await swap(SOL_ADDR, STATE.tokenAddress, w, connection, buyAmt, chatId, true);
+//                 await sleep(getPoissonDelay(2000));
+//             },
+//             STATE.batchConcurrency,
+//             null,
+//             () => STATE.running
+//         );
+
+//         if (!STATE.running) return;
+
+//         bot.sendMessage(chatId, `🔴 Whale Cluster dumping ${STATE.whaleSellPercent}% of holdings in stealth chunks...`, { parse_mode: 'Markdown' });
+//         await BatchSwapEngine.executeBatch(
+//             activeWhales,
+//             async (w) => {
+//                 const bal = await getTokenBalance(connection, w.publicKey, STATE.tokenAddress);
+//                 if (bal > 0) {
+//                     const dumpChunks = Math.floor(getRandomFloat(2, 5));
+//                     const chunkPercent = (dumpPct / 100) / dumpChunks;
+//                     for (let c = 0; c < dumpChunks; c++) {
+//                         const dumpAmt = parseFloat((bal * chunkPercent).toFixed(6));
+//                         await swap(STATE.tokenAddress, SOL_ADDR, w, connection, dumpAmt, chatId, true);
+//                         await sleep(getJitteredInterval(800, 15));
+//                     }
+//                 }
+//             },
+//             STATE.batchConcurrency,
+//             null,
+//             () => STATE.running
+//         );
+//     } finally {
+//         if (!usePool) {
+//             try {
+//                 await drainWallets(connection, activeWhales, masterKeypair.publicKey, chatId);
+//             } catch (drainErr) {
+//                 logger.error(`Drain failed in Whale strategy: ${drainErr.message}`);
+//             }
+//         }
+//     }
+//     bot.sendMessage(chatId, `🐋 Whale simulation complete.`);
+// }
 
 // ─────────────────────────────────────────────
 // 8. ADVANCED VOLUME BOOSTING
@@ -1289,14 +1427,6 @@ async function executeJitoMevWash(chatId, connection) {
             bot.sendMessage(chatId, `🌪️ Wash Bundle ${i + 1}/${cycles} [${activeWallet.publicKey.toBase58().substring(0,4)}...]: \`${amt}\` SOL`, { parse_mode: 'Markdown' });
             
             try {
-                const solanaTracker = new SolanaTracker(activeWallet, RPC_URL);
-                
-                // 1. Get Buy TX
-                const buyRes = await solanaTracker.getSwapInstructions(
-                    SOL_ADDR, STATE.tokenAddress, amt, STATE.slippage, activeWallet.publicKey.toBase58(), 0, false
-                );
-                if (!buyRes || !buyRes.txn) throw new Error("Failed to get Buy instruction");
-
                 // Sequential swap with Jito enabled (handled internally by swap function)
                 const buyId = await swap(SOL_ADDR, STATE.tokenAddress, activeWallet, connection, amt, chatId, true);
                 if (buyId) {
@@ -2100,14 +2230,15 @@ bot.on('callback_query', async (callbackQuery) => {
     // Settings Handlers with validation
     else if (action === 'set_token_address') {
         promptSetting(chatId, `Reply with the *Token Address (CA)*:`, (val) => {
-            if (!val || val.length < 32) {
-                bot.sendMessage(chatId, "❌ Invalid CA.");
-                return;
+            try {
+                STATE.tokenAddress = validateTokenAddress(val);
+                saveConfig();
+                bot.sendMessage(chatId, `✅ Token CA set to:\n\`${STATE.tokenAddress}\``, { parse_mode: "Markdown" });
+                showBasicSettings(chatId);
+            } catch (e) {
+                bot.sendMessage(chatId, `❌ ${e.message}`);
+                showBasicSettings(chatId);
             }
-            STATE.tokenAddress = val;
-            saveConfig();
-            bot.sendMessage(chatId, `✅ Token CA set to:\n\`${STATE.tokenAddress}\``, { parse_mode: "Markdown" });
-            showBasicSettings(chatId);
         });
     }
     else if (action === 'toggle_realism') { STATE.realismMode = !STATE.realismMode; saveConfig(); showRealismMenu(chatId); }
