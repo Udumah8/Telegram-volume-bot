@@ -23,26 +23,45 @@ export class BatchSwapEngine {
         const results = new Array(total).fill(null);
         let index = 0;
 
+        // --- NON-ROBOTIC UPGRADE: SHUFFLE WALLETS ---
+        // Shuffling ensures we don't always use the same wallets in the same order
+        const shuffledIndices = Array.from({ length: total }, (_, i) => i);
+        for (let i = shuffledIndices.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [shuffledIndices[i], shuffledIndices[j]] = [shuffledIndices[j], shuffledIndices[i]];
+        }
+
         // Report interval: every 5% or at minimum every 10 completions
         const reportEvery = Math.max(1, Math.min(10, Math.floor(total / 20)));
 
-        const worker = async () => {
+        const worker = async (workerId) => {
+            // Initial jitter per worker to spread out the burst
+            const initialDelay = Math.random() * 800;
+            await new Promise(r => setTimeout(r, initialDelay));
+
             while (true) {
                 // Grab next index atomically
                 const i = index++;
                 if (i >= total) break;
 
+                const actualIndex = shuffledIndices[i];
+
                 // Check if bot is still running
                 if (checkRunning && !checkRunning()) break;
 
                 try {
-                    const result = await actionFn(wallets[i], i);
-                    results[i] = result;
+                    // --- NON-ROBOTIC UPGRADE: PER-ACTION JITTER ---
+                    // Small random pause before each trade within a worker
+                    const perActionJitter = Math.random() * 400;
+                    await new Promise(r => setTimeout(r, perActionJitter));
+
+                    const result = await actionFn(wallets[actualIndex], actualIndex);
+                    results[actualIndex] = result;
                     if (result !== null && result !== undefined) successes++;
                     else failures++;
                 } catch (e) {
                     failures++;
-                    console.error(`[BatchEngine] Wallet ${i} error: ${e.message}`);
+                    console.error(`[BatchEngine] Worker ${workerId} | Wallet ${actualIndex} error: ${e.message}`);
                 }
 
                 completed++;
@@ -56,7 +75,7 @@ export class BatchSwapEngine {
         // Spawn `concurrency` workers
         const workers = Array.from(
             { length: Math.min(concurrency, total) },
-            () => worker()
+            (_, i) => worker(i)
         );
         await Promise.all(workers);
 
@@ -79,8 +98,10 @@ export class BatchSwapEngine {
                 const buyResult = await swapFn(solAddr, tokenAddress, wallet, connection, amount, null, true);
                 if (!buyResult) return null;
 
-                // Small delay between buy and sell
-                await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+                // --- NON-ROBOTIC UPGRADE: DYNAMIC DELAYS ---
+                // Increase variance between buy and sell (1s to 5s)
+                const holdDelay = 1200 + Math.random() * 3800;
+                await new Promise(r => setTimeout(r, holdDelay));
 
                 // Sell all
                 const sellResult = await swapFn(tokenAddress, solAddr, wallet, connection, 'auto', null, true);

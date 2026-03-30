@@ -129,10 +129,10 @@ function isRateLimited(chatId) {
 
 // ---------- Constants & State ----------
 const PERSONALITIES = {
-    DIAMOND: { buyProb: 0.8, sellProb: 0.1, minHold: 5, maxHold: 15, sizeMult: 0.8 },
-    SCALPER: { buyProb: 0.9, sellProb: 0.8, minHold: 1, maxHold: 3, sizeMult: 1.2 },
-    RETAIL:  { buyProb: 0.5, sellProb: 0.4, minHold: 2, maxHold: 6, sizeMult: 0.5 },
-    WHALE:   { buyProb: 0.3, sellProb: 0.05, minHold: 10, maxHold: 30, sizeMult: 3.0 }
+    DIAMOND: { buyProb: 0.8, sellProb: 0.1, minHold: 5, maxHold: 15, sizeMult: 0.8, minThink: 2000, maxThink: 8000 },
+    SCALPER: { buyProb: 0.9, sellProb: 0.8, minHold: 1, maxHold: 3, sizeMult: 1.2, minThink: 500, maxThink: 2500 },
+    RETAIL:  { buyProb: 0.5, sellProb: 0.4, minHold: 2, maxHold: 6, sizeMult: 0.5, minThink: 1000, maxThink: 6000 },
+    WHALE:   { buyProb: 0.3, sellProb: 0.05, minHold: 10, maxHold: 30, sizeMult: 3.0, minThink: 3000, maxThink: 20000 }
 };
 
 const STATE = {
@@ -463,13 +463,14 @@ async function executeStandardCycles(chatId, connection) {
         bot.sendMessage(chatId, `🔄 *Standard | Cycle ${i + 1}/${STATE.numberOfCycles}* | Vol: \`${volMult.toFixed(2)}x\``, { parse_mode: "Markdown" });
 
         const activeWallets = usePool ? walletPool.getRandomSubset(walletCount) : [masterKeypair];
-        const buyAmount = parseFloat((getRandomFloat(STATE.minBuyAmount, STATE.maxBuyAmount) * volMult).toFixed(4));
-        
-        bot.sendMessage(chatId, `🛒 Buying \`${buyAmount}\` SOL across ${activeWallets.length} wallets...`, { parse_mode: "Markdown" });
+        bot.sendMessage(chatId, `🛒 Buying SOL across ${activeWallets.length} wallets (per-wallet randomization)...`, { parse_mode: "Markdown" });
 
         await BatchSwapEngine.executeBatch(
             activeWallets,
-            async (w) => await swap(SOL_ADDR, STATE.tokenAddress, w, connection, buyAmount, chatId, true),
+            async (w) => {
+                const jitteredBuy = parseFloat((getRandomFloat(STATE.minBuyAmount, STATE.maxBuyAmount) * volMult).toFixed(4));
+                return await swap(SOL_ADDR, STATE.tokenAddress, w, connection, jitteredBuy, chatId, true);
+            },
             STATE.batchConcurrency,
             null,
             () => STATE.running
@@ -551,6 +552,10 @@ async function executeMakerCycles(chatId, connection) {
                     
                     if (balance > 0) {
                         if (w.holdCyclesRemaining <= 0 && roll < w.personality.sellProb) {
+                            // Non-robotic: Humanized "thinking" delay before acting
+                            const thinkTime = getRandomFloat(w.personality.minThink, w.personality.maxThink);
+                            await sleep(thinkTime);
+
                             const sellAmt = Math.random() < 0.7 ? 'auto' : (balance * getRandomFloat(0.3, 0.7)).toFixed(6);
                             return swap(STATE.tokenAddress, SOL_ADDR, w.keypair, connection, sellAmt, chatId, true);
                         } else {
@@ -558,6 +563,10 @@ async function executeMakerCycles(chatId, connection) {
                         }
                     } else {
                         if (roll < w.personality.buyProb) {
+                            // Non-robotic: Humanized "thinking" delay before acting
+                            const thinkTime = getRandomFloat(w.personality.minThink, w.personality.maxThink);
+                            await sleep(thinkTime);
+
                             const baseAmt = getRandomFloat(STATE.minBuyAmount, STATE.maxBuyAmount);
                             const buyAmt = parseFloat((baseAmt * w.personality.sizeMult * volMult).toFixed(4));
                             w.holdCyclesRemaining = Math.floor(getRandomFloat(w.personality.minHold, w.personality.maxHold));
@@ -614,6 +623,7 @@ async function executeWebOfActivity(chatId, connection) {
                 if (balance > 0 && Math.random() < 0.6) {
                     return swap(STATE.tokenAddress, SOL_ADDR, w, connection, 'auto', chatId, true);
                 } else {
+                    // Non-robotic: Randomize amount per-wallet
                     const amt = parseFloat((getRandomFloat(STATE.minBuyAmount, STATE.maxBuyAmount) * getVolumeMultiplier()).toFixed(4));
                     return swap(SOL_ADDR, STATE.tokenAddress, w, connection, amt, chatId, true);
                 }
@@ -622,13 +632,14 @@ async function executeWebOfActivity(chatId, connection) {
             null,
             () => STATE.running
         );
+        
         await sleep(getPoissonDelay(STATE.intervalBetweenActions));
     }
     
     if (!usePool) {
         await drainWallets(connection, targets, masterKeypair.publicKey, chatId);
     }
-    bot.sendMessage(chatId, `✅ Web of Activity complete (${walletCount} wallets).`);
+    bot.sendMessage(chatId, `✅ Web of Activity complete.`);
 }
 
 async function executeSpamMode(chatId, connection) {
@@ -639,12 +650,14 @@ async function executeSpamMode(chatId, connection) {
     let globalSuccessCount = 0;
     for (let i = 0; i < STATE.numberOfCycles && STATE.running; i++) {
         const activeWallets = usePool ? walletPool.getRandomSubset(walletCount) : [masterKeypair];
-        const microAmt = getRandomFloat(STATE.spamMicroBuyAmount * 0.5, STATE.spamMicroBuyAmount * 1.5);
-        bot.sendMessage(chatId, `⚡ Spam Cycle ${i + 1}/${STATE.numberOfCycles} (${microAmt.toFixed(6)} SOL)...`);
+        bot.sendMessage(chatId, `⚡ Spam Cycle ${i + 1}/${STATE.numberOfCycles}...`);
         
         const { successes } = await BatchSwapEngine.executeBatch(
             activeWallets,
-            async (w) => await swap(SOL_ADDR, STATE.tokenAddress, w, connection, microAmt, chatId, true),
+            async (w) => {
+                const jitteredSpam = parseFloat((STATE.spamMicroBuyAmount * (0.8 + Math.random() * 0.4)).toFixed(6));
+                return await swap(SOL_ADDR, STATE.tokenAddress, w, connection, jitteredSpam, chatId, true);
+            },
             STATE.batchConcurrency,
             null,
             () => STATE.running
@@ -700,12 +713,14 @@ async function executeChartPattern(chatId, connection) {
         }
 
         const activeWallets = usePool ? walletPool.getRandomSubset(walletCount) : [masterKeypair];
-        const buyAmount = parseFloat((STATE.minBuyAmount + (STATE.maxBuyAmount - STATE.minBuyAmount) * buyMult * 0.7).toFixed(4));
-        bot.sendMessage(chatId, `📐 Cycle ${i + 1}/${n} [${pattern}] | Buy: \`${buyAmount}\` SOL | SellFrac: \`${(sellFrac * 100).toFixed(0)}%\``, { parse_mode: 'Markdown' });
+        bot.sendMessage(chatId, `📐 Cycle ${i + 1}/${n} [${pattern}] | Randomized Buy | SellFrac: \`${(sellFrac * 100).toFixed(0)}%\``, { parse_mode: 'Markdown' });
 
         await BatchSwapEngine.executeBatch(
             activeWallets,
-            async (w) => await swap(SOL_ADDR, STATE.tokenAddress, w, connection, buyAmount, chatId, true),
+            async (w) => {
+                const jitteredBuy = parseFloat((STATE.minBuyAmount + (STATE.maxBuyAmount - STATE.minBuyAmount) * buyMult * 0.7 * (0.85 + Math.random() * 0.3)).toFixed(4));
+                return await swap(SOL_ADDR, STATE.tokenAddress, w, connection, jitteredBuy, chatId, true);
+            },
             STATE.batchConcurrency,
             null,
             () => STATE.running
